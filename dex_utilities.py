@@ -4,6 +4,7 @@ Dex's Utilities
   1) Baixar vídeos de links (yt-dlp)
   2) Baixar galerias / GIFs / imagens (gallery-dl, ex.: Kemono)
   3) Preparar vídeo para status do WhatsApp (ffmpeg)
+  4) Identificar música, estilo Shazam (shazamio)
 """
 import os
 import re
@@ -11,12 +12,13 @@ import shutil
 import subprocess
 import sys
 import threading
+import webbrowser
 import urllib.request
 import zipfile
 from pathlib import Path
 
 APP_NAME = "Dex's Utilities"
-APP_VERSION = 2
+APP_VERSION = 3
 IS_WIN = os.name == "nt"
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if IS_WIN else 0
 FFMPEG_URLS = [
@@ -249,6 +251,167 @@ def preparar_status(arquivo, tela_cheia, duracao, tamanho_mb, log):
 
 
 # --------------------------------------------------------------------------- #
+#  4) Identificar música (estilo Shazam)
+# --------------------------------------------------------------------------- #
+AVISO_LIBS = ("Esta função usa bibliotecas novas que ainda não estão no seu .exe.\n"
+              "Rode o build.bat do zip mais recente (só uma vez) e abra o programa de novo.")
+
+
+def _rms(x):
+    import numpy as np
+    return float(np.sqrt(np.mean(np.square(x)))) if len(x) else 0.0
+
+
+def _wav_bytes(mono_int16, rate):
+    import io
+    import wave
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(mono_int16.tobytes())
+    return buf.getvalue()
+
+
+def capturar_audio(fonte, segundos, progress, log):
+    """Grava o som do computador (loopback do Windows) ou do microfone."""
+    import time
+    import numpy as np
+    import pyaudiowpatch as pyaudio
+
+    pa = pyaudio.PyAudio()
+    quadros = []
+    try:
+        dev = pa.get_default_wasapi_loopback() if fonte == "computador" \
+            else pa.get_default_input_device_info()
+        rate = int(dev["defaultSampleRate"])
+        canais = max(1, min(int(dev["maxInputChannels"]), 2))
+        log(f"Ouvindo por {segundos}s: {dev['name']}")
+
+        def callback(in_data, frame_count, time_info, status):
+            quadros.append(in_data)
+            return (None, pyaudio.paContinue)
+
+        stream = pa.open(format=pyaudio.paInt16, channels=canais, rate=rate, input=True,
+                         input_device_index=dev["index"], frames_per_buffer=1024,
+                         stream_callback=callback)
+        inicio = time.time()
+        while time.time() - inicio < segundos:
+            progress((time.time() - inicio) * 100 / segundos)
+            time.sleep(0.1)
+        stream.stop_stream()
+        stream.close()
+    finally:
+        pa.terminate()
+    if not quadros:
+        raise RuntimeError("Não captei nenhum som. Dê play na música e tente de novo.")
+    audio = np.frombuffer(b"".join(quadros), dtype=np.int16)
+    return audio.reshape(-1, canais), rate
+
+
+def audio_de_arquivo(arquivo, log, max_seg=120):
+    import numpy as np
+    ffmpeg = ensure_ffmpeg(log)
+    p = subprocess.run([ffmpeg, "-v", "error", "-i", str(arquivo), "-vn", "-t", str(max_seg),
+                        "-ac", "2", "-ar", "44100", "-f", "s16le", "-"],
+                       capture_output=True, stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
+    audio = np.frombuffer(p.stdout, dtype=np.int16)
+    if len(audio) < 44100 * 2:
+        raise RuntimeError("Não consegui extrair áudio desse arquivo.")
+    return audio[: len(audio) // 2 * 2].reshape(-1, 2), 44100
+
+
+def gerar_trechos(audio, rate, janela=8, passo=3, max_janelas=8):
+    """Corta em janelas que se sobrepõem. Para cada uma gera a mixagem normal e, se
+    for estéreo, uma versão com o centro cancelado (onde costuma ficar a voz do meme)."""
+    import numpy as np
+    n, canais = audio.shape
+    j, p = int(janela * rate), int(passo * rate)
+    inicios = list(range(0, max(n - j, 0) + 1, p)) or [0]
+    if len(inicios) > max_janelas:
+        idx = np.linspace(0, len(inicios) - 1, max_janelas).astype(int)
+        inicios = [inicios[i] for i in idx]
+
+    def norm(x):
+        pico = float(np.max(np.abs(x))) or 1.0
+        return (x / pico * 0.9 * 32767).astype(np.int16)
+
+    trechos = []
+    for ini in inicios:
+        seg = audio[ini: ini + j].astype(np.float32)
+        if len(seg) < rate * 3:
+            continue
+        mid = seg.mean(axis=1)
+        if _rms(mid) < 30:  # silêncio
+            continue
+        trechos.append(("mix", ini / rate, norm(mid)))
+        if canais == 2:
+            side = (seg[:, 0] - seg[:, 1]) / 2
+            if _rms(side) > 0.15 * _rms(mid):
+                trechos.append(("sem voz central", ini / rate, norm(side)))
+    return trechos
+
+
+async def _reconhecer(trechos, rate, log):
+    from shazamio import Shazam
+    sh = Shazam()
+    votos, falhas = {}, 0
+    for tipo, t0, sinal in trechos:
+        try:
+            r = await sh.recognize(_wav_bytes(sinal, rate))
+        except Exception as e:  # noqa: BLE001
+            falhas += 1
+            log(f"  {t0:4.0f}s ({tipo}): falhou ({type(e).__name__})")
+            continue
+        faixa = r.get("track")
+        if not faixa:
+            log(f"  {t0:4.0f}s ({tipo}): nada")
+            continue
+        chave = faixa.get("key") or faixa.get("title")
+        log(f"  {t0:4.0f}s ({tipo}): {faixa.get('subtitle', '?')} - {faixa.get('title', '?')}")
+        info = votos.setdefault(chave, {"n": 0, "faixa": faixa})
+        info["n"] += 1
+    try:
+        await sh.close()
+    except Exception:  # noqa: BLE001
+        pass
+    if falhas == len(trechos):
+        raise RuntimeError("Não consegui falar com o serviço de reconhecimento. "
+                           "Verifique a internet e tente de novo.")
+    if not votos:
+        return None
+    melhor = max(votos.values(), key=lambda v: v["n"])
+    f = melhor["faixa"]
+    return {"titulo": f.get("title", "?"), "artista": f.get("subtitle", "?"),
+            "url": f.get("url", ""), "votos": melhor["n"], "total": len(trechos) - falhas,
+            "outros": [(v["faixa"].get("subtitle", "?"), v["faixa"].get("title", "?"), v["n"])
+                       for v in votos.values() if v is not melhor]}
+
+
+def identificar_musica(fonte, arquivo, segundos, log, progress, mostrar):
+    import asyncio
+    try:
+        import numpy  # noqa: F401
+        import shazamio  # noqa: F401
+        if fonte != "arquivo":
+            import pyaudiowpatch  # noqa: F401
+    except ImportError:
+        raise RuntimeError(AVISO_LIBS)
+
+    if fonte == "arquivo":
+        audio, rate = audio_de_arquivo(arquivo, log)
+    else:
+        audio, rate = capturar_audio(fonte, segundos, progress, log)
+    trechos = gerar_trechos(audio, rate)
+    if not trechos:
+        raise RuntimeError("Não captei som suficiente. Aumente o volume e tente de novo.")
+    log(f"Analisando {len(trechos)} trechos...")
+    resultado = asyncio.run(_reconhecer(trechos, rate, log))
+    mostrar(resultado)
+
+
+# --------------------------------------------------------------------------- #
 #  Interface
 # --------------------------------------------------------------------------- #
 def run_gui():
@@ -288,6 +451,8 @@ def run_gui():
     st.configure("TLabel", background=BG, foreground=FG)
     st.configure("Muted.TLabel", foreground=MUTED)
     st.configure("TEntry", fieldbackground=CARD, foreground=FG, insertcolor=FG, bordercolor=CARD)
+    st.configure("TRadiobutton", background=BG, foreground=FG)
+    st.map("TRadiobutton", background=[("active", BG)])
     st.configure("TCheckbutton", background=BG, foreground=FG)
     st.map("TCheckbutton", background=[("active", BG)])
     st.configure("TButton", background=CARD, foreground=FG, padding=8, borderwidth=0)
@@ -444,6 +609,76 @@ def run_gui():
     buttons.append(b3)
     ttk.Label(t3, text="As partes ficam numa pasta ao lado do vídeo original. Envie-as em ordem pelo celular.",
               style="Muted.TLabel", wraplength=640).pack(anchor="w", pady=(12, 0))
+
+    # ---- aba 4: identificar música ----
+    t4 = ttk.Frame(nb, padding=16)
+    nb.add(t4, text="  Identificar música  ")
+    ttk.Label(t4, text="De onde vem o som?").pack(anchor="w")
+    m_src = tk.StringVar(value="computador")
+    for txt, val in (("Som que está tocando no computador (melhor para memes e vídeos)", "computador"),
+                     ("Microfone (música tocando em outro aparelho)", "microfone"),
+                     ("Um arquivo de vídeo/áudio que eu já tenho", "arquivo")):
+        ttk.Radiobutton(t4, text=txt, value=val, variable=m_src).pack(anchor="w", pady=1)
+    mrow = ttk.Frame(t4)
+    mrow.pack(fill="x", pady=(8, 8))
+    m_file = tk.StringVar()
+    ttk.Entry(mrow, textvariable=m_file).pack(side="left", fill="x", expand=True)
+    ttk.Button(mrow, text="Arquivo...", command=lambda: (m_file.set(
+        filedialog.askopenfilename(filetypes=[("Vídeo/áudio", "*.mp4 *.mov *.mkv *.webm *.mp3 *.wav *.m4a *.ogg"),
+                                              ("Todos", "*.*")]) or m_file.get()),
+        m_src.set("arquivo"))).pack(side="left", padx=(8, 0))
+    mdur = ttk.Frame(t4)
+    mdur.pack(fill="x", pady=(0, 10))
+    ttk.Label(mdur, text="Tempo de escuta (s):", style="Muted.TLabel").pack(side="left")
+    m_dur = tk.StringVar(value="15")
+    ttk.Entry(mdur, textvariable=m_dur, width=5).pack(side="left", padx=6)
+    ttk.Label(mdur, text="(mais tempo = mais chance de acertar com voz por cima)",
+              style="Muted.TLabel").pack(side="left", padx=6)
+
+    m_titulo = tk.StringVar(value="")
+    m_info = tk.StringVar(value="")
+    m_url = {"v": ""}
+    ttk.Label(t4, textvariable=m_titulo, font=("Segoe UI", 15, "bold"), wraplength=680).pack(anchor="w", pady=(4, 0))
+    ttk.Label(t4, textvariable=m_info, style="Muted.TLabel", wraplength=680).pack(anchor="w")
+
+    def mostrar_resultado(r):
+        def _do():
+            if not r:
+                m_titulo.set("Não consegui identificar")
+                m_info.set("Tente de novo com mais tempo de escuta, volume mais alto ou menos fala por cima.")
+                m_url["v"] = ""
+            else:
+                m_titulo.set(f"{r['artista']} - {r['titulo']}")
+                conf = r["votos"] / max(r["total"], 1)
+                nivel = "alta" if conf >= 0.5 else ("média" if r["votos"] >= 2 else "baixa")
+                m_info.set(f"Confiança {nivel}: {r['votos']} de {r['total']} trechos concordaram."
+                           + ("  Outras possibilidades: " + "; ".join(f"{a} - {t}" for a, t, _ in r["outros"][:2])
+                              if r["outros"] else ""))
+                m_url["v"] = r["url"]
+            b_open.configure(state="normal" if m_url["v"] else "disabled")
+        root.after(0, _do)
+
+    def go4():
+        fonte = m_src.get()
+        if fonte == "arquivo" and not Path(m_file.get().strip()).exists():
+            return messagebox.showwarning(APP_NAME, "Escolha um arquivo válido.")
+        try:
+            seg = max(5, min(int(m_dur.get()), 60))
+        except ValueError:
+            return messagebox.showwarning(APP_NAME, "O tempo de escuta precisa ser um número.")
+        m_titulo.set("")
+        m_info.set("")
+        b_open.configure(state="disabled")
+        worker(identificar_musica, fonte, m_file.get().strip(), seg, log, progress, mostrar_resultado)
+
+    b4row = ttk.Frame(t4)
+    b4row.pack(anchor="w", pady=(6, 0))
+    b4 = ttk.Button(b4row, text="Ouvir e identificar", style="Accent.TButton", command=go4)
+    b4.pack(side="left")
+    buttons.append(b4)
+    b_open = ttk.Button(b4row, text="Abrir no Shazam", state="disabled",
+                        command=lambda: m_url["v"] and webbrowser.open(m_url["v"]))
+    b_open.pack(side="left", padx=(10, 0))
 
     log("Bem-vindo ao Dex's Utilities. Escolha uma aba para começar.")
 
