@@ -18,7 +18,7 @@ import zipfile
 from pathlib import Path
 
 APP_NAME = "Dex's Utilities"
-APP_VERSION = 4
+APP_VERSION = 5
 IS_WIN = os.name == "nt"
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if IS_WIN else 0
 FFMPEG_URLS = [
@@ -262,6 +262,7 @@ AVISO_LIBS = ("Esta função usa bibliotecas novas que ainda não estão no seu 
 
 def _rms(x):
     import numpy as np
+    x = np.asarray(x, dtype=np.float32)  # evita estouro de int16 ao elevar ao quadrado
     return float(np.sqrt(np.mean(np.square(x)))) if len(x) else 0.0
 
 
@@ -356,43 +357,131 @@ def gerar_trechos(audio, rate, janela=8, passo=3, max_janelas=8):
     return trechos
 
 
-async def _reconhecer(trechos, rate, log):
-    from shazamio import Shazam
-    sh = Shazam()
+# Fatores para "desfazer" slowed / sped up: tocar o áudio mais rápido (>1) recupera um slowed,
+# mais devagar (<1) recupera um sped up. Ordem = as velocidades mais comuns primeiro.
+FATORES = [1.25, 1.18, 1.11, 1.33, 1.05, 0.9, 0.8, 0.85, 1.5, 0.75, 0.95, 0.7]
+SKEW_OK = 0.03  # acima disso, o áudio difere do que está no catálogo (velocidade/tom alterados)
+MARCAS_VERSAO = ("slowed", "sped", "speed", "reverb", "nightcore", "remix", "edit", "version", "lofi", "lo-fi")
+
+
+def _skew_de(r):
+    m = (r.get("matches") or [{}])[0]
+    return abs(m.get("frequencyskew", 0) or 0), abs(m.get("timeskew", 0) or 0)
+
+
+async def _rodada(sh, trechos, rate, fator, log, rotulo):
+    """Reconhece cada trecho (tocado na velocidade `fator`) e junta os votos por música."""
     votos, falhas = {}, 0
     for tipo, t0, sinal in trechos:
         try:
-            r = await sh.recognize(_wav_bytes(sinal, rate))
+            r = await sh.recognize(_wav_bytes(sinal, int(rate * fator)))
         except Exception as e:  # noqa: BLE001
             falhas += 1
-            log(f"  {t0:4.0f}s ({tipo}): falhou ({type(e).__name__})")
+            log(f"  {t0:4.0f}s ({tipo}, {rotulo}): falhou ({type(e).__name__})")
             continue
         faixa = r.get("track")
         if not faixa:
-            log(f"  {t0:4.0f}s ({tipo}): nada")
+            log(f"  {t0:4.0f}s ({tipo}, {rotulo}): nada")
             continue
+        sf, st = _skew_de(r)
         chave = faixa.get("key") or faixa.get("title")
-        log(f"  {t0:4.0f}s ({tipo}): {faixa.get('subtitle', '?')} - {faixa.get('title', '?')}")
-        info = votos.setdefault(chave, {"n": 0, "faixa": faixa})
+        log(f"  {t0:4.0f}s ({tipo}, {rotulo}): {faixa.get('subtitle', '?')} - {faixa.get('title', '?')}")
+        info = votos.setdefault(chave, {"n": 0, "faixa": faixa, "skews": []})
         info["n"] += 1
-    try:
-        await sh.close()
-    except Exception:  # noqa: BLE001
-        pass
-    if falhas == len(trechos):
-        raise RuntimeError("Não consegui falar com o serviço de reconhecimento. "
-                           "Verifique a internet e tente de novo.")
+        info["skews"].append(max(sf, st))
+    return votos, falhas
+
+
+def _melhor(votos):
     if not votos:
         return None
-    melhor = max(votos.values(), key=lambda v: v["n"])
-    f = melhor["faixa"]
-    return {"titulo": f.get("title", "?"), "artista": f.get("subtitle", "?"),
-            "url": f.get("url", ""), "votos": melhor["n"], "total": len(trechos) - falhas,
-            "outros": [(v["faixa"].get("subtitle", "?"), v["faixa"].get("title", "?"), v["n"])
-                       for v in votos.values() if v is not melhor]}
+    m = max(votos.values(), key=lambda v: v["n"])
+    m["skew"] = sorted(m["skews"])[len(m["skews"]) // 2]  # mediana
+    return m
 
 
-def identificar_musica(fonte, arquivo, segundos, log, progress, mostrar):
+def _tokens_artista(texto):
+    import re as _re
+    return {t for t in _re.split(r"[^a-z0-9]+", (texto or "").lower()) if len(t) > 2}
+
+
+async def _versoes_catalogo(sh, faixa, termos, log):
+    """Procura no catálogo outras versões (slowed, sped up...) da mesma música."""
+    achadas, vistos = [], {faixa.get("key")}
+    base = _tokens_artista(faixa.get("subtitle"))
+    for termo in termos:
+        try:
+            lista = await sh.search_tracks_via_itunes(f"{faixa.get('subtitle', '')} {faixa.get('title', '')} {termo}",
+                                                      limit=10)
+        except Exception as e:  # noqa: BLE001
+            log(f"  busca de versões falhou ({type(e).__name__})")
+            break
+        for r in lista:
+            t = r.get("track", r) if isinstance(r, dict) else {}
+            titulo = (t.get("title") or "")
+            if not t.get("key") or t["key"] in vistos:
+                continue
+            if any(m in titulo.lower() for m in MARCAS_VERSAO) and (base & _tokens_artista(t.get("subtitle"))):
+                vistos.add(t["key"])
+                achadas.append((t.get("subtitle", "?"), titulo, t.get("url", "")))
+    return achadas[:5]
+
+
+async def _reconhecer(trechos, rate, log, versao_exata=True):
+    from shazamio import Shazam
+    sh = Shazam()
+    try:
+        votos, falhas = await _rodada(sh, trechos, rate, 1.0, log, "normal")
+        if falhas == len(trechos):
+            raise RuntimeError("Não consegui falar com o serviço de reconhecimento. "
+                               "Verifique a internet e tente de novo.")
+        melhor, fator = _melhor(votos), 1.0
+        total = len(trechos) - falhas
+
+        if versao_exata and (not melhor or melhor["skew"] > SKEW_OK):
+            log("Conferindo se o áudio está acelerado ou desacelerado (slowed / sped up)...")
+            mixes = sorted([t for t in trechos if t[0] == "mix"], key=lambda t: -_rms(t[2]))[:3]
+            for f in FATORES:
+                if not mixes:
+                    break
+                v1, _ = await _rodada(sh, mixes[:1], rate, f, log, f"{1 / f:.2f}x")
+                m1 = _melhor(v1)
+                if not m1 or m1["skew"] > SKEW_OK:
+                    continue
+                v2, _ = await _rodada(sh, mixes[1:], rate, f, log, f"{1 / f:.2f}x")
+                chave = next(iter(v1))
+                confirmacoes = 1 + (v2[chave]["n"] if chave in v2 else 0)
+                if confirmacoes >= 2 or len(mixes) == 1:
+                    votos = v1
+                    if chave in v2:
+                        v1[chave]["n"] += v2[chave]["n"]
+                        v1[chave]["skews"] += v2[chave]["skews"]
+                    melhor, fator, total = _melhor(v1), f, len(mixes)
+                    break
+
+        if not melhor:
+            return None
+        alterada = fator != 1.0 or melhor["skew"] > SKEW_OK
+        f = melhor["faixa"]
+        versoes = []
+        if versao_exata and alterada:
+            log("Procurando versões parecidas no catálogo...")
+            termos = ["slowed", "sped up"] if fator >= 1.0 else ["sped up", "slowed"]
+            versoes = await _versoes_catalogo(sh, f, termos, log)
+        return {"titulo": f.get("title", "?"), "artista": f.get("subtitle", "?"),
+                "url": f.get("url", ""), "votos": melhor["n"], "total": max(total, melhor["n"]),
+                "alterada": alterada, "velocidade": (1 / fator) if fator != 1.0 else None,
+                "versoes": versoes,
+                "outros": [(v["faixa"].get("subtitle", "?"), v["faixa"].get("title", "?"), v["n"])
+                           for v in votos.values() if v is not melhor]}
+    finally:
+        try:
+            await sh.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def identificar_musica(fonte, arquivo, segundos, versao_exata, log, progress, mostrar):
     import asyncio
     try:
         import numpy  # noqa: F401
@@ -410,7 +499,7 @@ def identificar_musica(fonte, arquivo, segundos, log, progress, mostrar):
     if not trechos:
         raise RuntimeError("Não captei som suficiente. Aumente o volume e tente de novo.")
     log(f"Analisando {len(trechos)} trechos...")
-    resultado = asyncio.run(_reconhecer(trechos, rate, log))
+    resultado = asyncio.run(_reconhecer(trechos, rate, log, versao_exata))
     mostrar(resultado)
 
 
@@ -638,6 +727,9 @@ def run_gui():
     ttk.Label(mdur, text="(mais tempo = mais chance de acertar com voz por cima)",
               style="Muted.TLabel").pack(side="left", padx=6)
 
+    m_exata = tk.BooleanVar(value=True)
+    ttk.Checkbutton(t4, text="Descobrir a versão exata (slowed, sped up...) - mais lento",
+                    variable=m_exata).pack(anchor="w", pady=(0, 8))
     m_titulo = tk.StringVar(value="")
     m_info = tk.StringVar(value="")
     m_url = {"v": ""}
@@ -651,12 +743,30 @@ def run_gui():
                 m_info.set("Tente de novo com mais tempo de escuta, volume mais alto ou menos fala por cima.")
                 m_url["v"] = ""
             else:
-                m_titulo.set(f"{r['artista']} - {r['titulo']}")
+                nome = f"{r['artista']} - {r['titulo']}"
                 conf = r["votos"] / max(r["total"], 1)
                 nivel = "alta" if conf >= 0.5 else ("média" if r["votos"] >= 2 else "baixa")
-                m_info.set(f"Confiança {nivel}: {r['votos']} de {r['total']} trechos concordaram."
-                           + ("  Outras possibilidades: " + "; ".join(f"{a} - {t}" for a, t, _ in r["outros"][:2])
-                              if r["outros"] else ""))
+                linhas = []
+                if r["alterada"]:
+                    if r["velocidade"]:
+                        pct = round(r["velocidade"] * 100)
+                        tipo = "slowed (mais lenta)" if pct < 100 else "sped up (acelerada)"
+                        m_titulo.set(f"{nome}  [{tipo}, ~{pct}% da velocidade]")
+                    else:
+                        m_titulo.set(f"{nome}  [versão alterada]")
+                    linhas.append("O áudio do vídeo difere do original (velocidade/tom alterados).")
+                    if r["versoes"]:
+                        linhas.append("Versões no catálogo que podem ser a do vídeo: "
+                                      + "; ".join(f"{a} - {t}" for a, t, _ in r["versoes"]))
+                    else:
+                        linhas.append("Não achei essa versão no catálogo; pode ser edição feita pelo criador do vídeo.")
+                else:
+                    m_titulo.set(nome)
+                    linhas.append("Versão exata do catálogo.")
+                linhas.append(f"Confiança {nivel}: {r['votos']} de {r['total']} trechos concordaram.")
+                if r["outros"]:
+                    linhas.append("Outras possibilidades: " + "; ".join(f"{a} - {t}" for a, t, _ in r["outros"][:2]))
+                m_info.set("\n".join(linhas))
                 m_url["v"] = r["url"]
             b_open.configure(state="normal" if m_url["v"] else "disabled")
         root.after(0, _do)
@@ -672,7 +782,7 @@ def run_gui():
         m_titulo.set("")
         m_info.set("")
         b_open.configure(state="disabled")
-        worker(identificar_musica, fonte, m_file.get().strip(), seg, log, progress, mostrar_resultado)
+        worker(identificar_musica, fonte, m_file.get().strip(), seg, m_exata.get(), log, progress, mostrar_resultado)
 
     b4row = ttk.Frame(t4)
     b4row.pack(anchor="w", pady=(6, 0))
