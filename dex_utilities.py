@@ -18,7 +18,7 @@ import zipfile
 from pathlib import Path
 
 APP_NAME = "Dex's Utilities"
-APP_VERSION = 3
+APP_VERSION = 4
 IS_WIN = os.name == "nt"
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if IS_WIN else 0
 FFMPEG_URLS = [
@@ -178,7 +178,10 @@ def baixar_galeria(link, pasta, log):
     if getattr(sys, "frozen", False):
         cmd = [sys.executable, "--gallery-dl"]
     else:
-        cmd = [sys.executable, os.path.abspath(__file__), "--gallery-dl"]
+        exe = sys.executable
+        if exe.lower().endswith("pythonw.exe"):  # usa o python com console oculto, para ler a saída
+            exe = exe[:-len("pythonw.exe")] + "python.exe"
+        cmd = [exe, os.path.abspath(__file__), "--gallery-dl"]
     cmd += ["-d", str(pasta), link]
     code = run_cmd(cmd, log)
     log("Pronto! Download concluído." if code == 0

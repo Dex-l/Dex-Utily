@@ -1,0 +1,7 @@
+yt-dlp[default,curl-cffi]
+gallery-dl
+pillow
+certifi
+numpy
+shazamio
+pyaudiowpatch; sys_platform == "win32"
